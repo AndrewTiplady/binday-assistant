@@ -5,3 +5,4 @@ __pycache__/
 *.log
 address_page.html
 schedule_page.html
+.env
