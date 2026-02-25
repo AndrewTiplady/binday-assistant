@@ -4,10 +4,7 @@ from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import requests
-import truststore
 from bs4 import BeautifulSoup
-
-truststore.inject_into_ssl()
 
 BASE = "https://bincollection.northumberland.gov.uk"
 
@@ -17,14 +14,30 @@ POSTCODE = "NE18 0QP"
 # Must match (fully or partially) one of the dropdown options on the address page
 ADDRESS_LABEL_MATCH = "The Bastle"
 
-# Which bins do you want reminders for?
-# (from schedule page cards: "General", "Garden", "Recycling")
-WATCH_FOR = {"General"}  # e.g. {"General", "Recycling"}
+# Which bins do you want reminders for? e.g. {"General", "Recycling"}
+WATCH_FOR = {"General"}
 # =================================
 
-# Telegram (set these as environment variables in PyCharm / GitHub Secrets)
+# Telegram (set as environment variables in PyCharm / GitHub Secrets)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Optional: set FORCE_TEST_MESSAGE=1 to always send a quick test ping (useful for GitHub Actions testing)
+FORCE_TEST_MESSAGE = os.getenv("FORCE_TEST_MESSAGE", "").strip() in {"1", "true", "TRUE", "yes", "YES"}
+
+
+def try_inject_truststore() -> None:
+    """
+    On some macOS Python installs, SSL verification can fail without truststore.
+    On GitHub Actions (Linux), this usually isn't needed, but it's safe.
+    """
+    try:
+        import truststore  # type: ignore
+
+        truststore.inject_into_ssl()
+    except Exception:
+        # If truststore isn't installed or fails, just continue.
+        pass
 
 
 def save_html(filename: str, html: str) -> None:
@@ -99,10 +112,22 @@ def extract_next_collections(schedule_html: str) -> list[dict]:
     return results
 
 
-def is_7pm_uk_now() -> bool:
-    """True iff current time in Europe/London is exactly 19:00."""
+def should_run_now_on_github_actions() -> bool:
+    """
+    GitHub scheduled runs happen in UTC and can drift a few minutes.
+    We enforce a 15-minute window at 19:00 UK time ONLY for scheduled runs.
+    Manual runs (workflow_dispatch) are allowed any time for testing.
+    """
+    if os.getenv("GITHUB_ACTIONS") != "true":
+        return True
+
+    event = os.getenv("GITHUB_EVENT_NAME", "")
+    if event != "schedule":
+        # Manual run / dispatch: allow anytime
+        return True
+
     now_uk = dt.datetime.now(ZoneInfo("Europe/London"))
-    return now_uk.hour == 19 and now_uk.minute == 0
+    return now_uk.hour == 19 and now_uk.minute < 15  # 19:00–19:14 window
 
 
 def send_telegram(message: str) -> None:
@@ -149,15 +174,22 @@ def build_reminder_message(due_bins: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def main():
-    s = requests.Session()
+def main() -> None:
+    try_inject_truststore()
 
-    # When running on GitHub Actions, only run at 7pm UK time (BST/GMT safe).
-    if os.getenv("GITHUB_ACTIONS") == "true" and not is_7pm_uk_now():
-        print("Not 7pm UK time — exiting (GitHub Actions run).")
+    if not should_run_now_on_github_actions():
+        print("Not within 7pm UK window — exiting (scheduled GitHub Actions run).")
         return
 
-    # Cookie observed in HTML (anti-bot-ish)
+    if FORCE_TEST_MESSAGE:
+        send_telegram("✅ Binchecker test: workflow ran and Telegram is working.")
+        print("FORCE_TEST_MESSAGE enabled — sent test Telegram message.")
+        # Continue to run normal logic too (harmless). If you'd rather stop here, uncomment:
+        # return
+
+    s = requests.Session()
+
+    # Cookie observed in site HTML (anti-bot-ish)
     s.cookies.set("x-bni-ja", "1707374704", domain="bincollection.northumberland.gov.uk", path="/")
 
     # 1) Load postcode page for CSRF
@@ -222,6 +254,7 @@ def main():
 
         message = build_reminder_message(due_tomorrow)
         send_telegram(message)
+        print("Sent Telegram reminder.")
     else:
         print("\nNo watched bins due tomorrow.")
 
