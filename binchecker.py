@@ -1,37 +1,13 @@
 import datetime as dt
+import os
 from urllib.parse import urljoin
-
-import truststore
-truststore.inject_into_ssl()
+from zoneinfo import ZoneInfo
 
 import requests
+import truststore
 from bs4 import BeautifulSoup
 
-import os
-
-# Telegram (set these as environment variables in PyCharm / scheduler)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-
-def send_telegram(message: str) -> None:
-    """Send a Telegram message using a bot token + chat id from environment variables."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError(
-            "Missing TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID environment variables"
-        )
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = requests.post(
-        url,
-        data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
+truststore.inject_into_ssl()
 
 BASE = "https://bincollection.northumberland.gov.uk"
 
@@ -39,13 +15,16 @@ BASE = "https://bincollection.northumberland.gov.uk"
 POSTCODE = "NE18 0QP"
 
 # Must match (fully or partially) one of the dropdown options on the address page
-# Example from your HTML: "The Bastle"
 ADDRESS_LABEL_MATCH = "The Bastle"
 
 # Which bins do you want reminders for?
-# From your schedule page cards: "General", "Garden", "Recycling"
+# (from schedule page cards: "General", "Garden", "Recycling")
 WATCH_FOR = {"General"}  # e.g. {"General", "Recycling"}
 # =================================
+
+# Telegram (set these as environment variables in PyCharm / GitHub Secrets)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 
 def save_html(filename: str, html: str) -> None:
@@ -62,9 +41,7 @@ def get_csrf(soup: BeautifulSoup) -> str:
 
 
 def select_address_option(soup: BeautifulSoup, label_match: str) -> tuple[str, str]:
-    """
-    Finds <select name="address"> and returns (value, label) for the matching option.
-    """
+    """Returns (address_value, address_label) from <select name='address'> matching label_match."""
     sel = soup.select_one('select[name="address"]')
     if not sel:
         raise RuntimeError("Couldn't find <select name='address'> on address selection page")
@@ -93,7 +70,7 @@ def select_address_option(soup: BeautifulSoup, label_match: str) -> tuple[str, s
 
 def extract_next_collections(schedule_html: str) -> list[dict]:
     """
-    Extracts the 3 'next collection' cards at the top of the schedule page:
+    Extracts the 'next collection' cards at the top of the schedule page:
       <div class="ncc-bin-calendar ...">
         <p>General</p>
         <p>Wednesday</p>
@@ -101,7 +78,7 @@ def extract_next_collections(schedule_html: str) -> list[dict]:
       </div>
     """
     soup = BeautifulSoup(schedule_html, "lxml")
-    results = []
+    results: list[dict] = []
 
     for card in soup.select("div.ncc-bin-calendar"):
         ps = [p.get_text(strip=True) for p in card.find_all("p")]
@@ -117,19 +94,40 @@ def extract_next_collections(schedule_html: str) -> list[dict]:
         except ValueError:
             continue
 
-        results.append(
-            {"type": bin_type, "day": day, "date": date_val, "raw": date_text}
-        )
+        results.append({"type": bin_type, "day": day, "date": date_val, "raw": date_text})
 
     return results
 
 
+def is_7pm_uk_now() -> bool:
+    """True iff current time in Europe/London is exactly 19:00."""
+    now_uk = dt.datetime.now(ZoneInfo("Europe/London"))
+    return now_uk.hour == 19 and now_uk.minute == 0
+
+
+def send_telegram(message: str) -> None:
+    """Send a Telegram message using bot token + chat id from environment variables."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID environment variables")
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    resp = requests.post(
+        url,
+        data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+
 def build_reminder_message(due_bins: list[dict]) -> str:
-    """Builds a tidy Telegram message. Uses a single-bin or multi-bin format."""
+    """Version A (single bin) / Version B (multiple bins) formatting."""
     if not due_bins:
         return ""
 
-    # Version A: single bin
     if len(due_bins) == 1:
         b = due_bins[0]
         return (
@@ -139,35 +137,36 @@ def build_reminder_message(due_bins: list[dict]) -> str:
             "Put it out tonight 👌"
         )
 
-    # Version B: multiple bins
     lines = ["🗑️ BIN DAY TOMORROW", ""]
     for b in due_bins:
-        # e.g. "General bin — Wed 25 Feb" (use short date)
         try:
-            short = b["date"].strftime("%a %d %b")
+            short = b["date"].strftime("%a %d %b")  # e.g., Wed 25 Feb
         except Exception:
             short = f"{b['day']} {b['raw']}"
         lines.append(f"{b['type']} bin — {short}")
 
-    lines.extend(["", "Put them out tonight 👌"])  # plural phrasing
+    lines.extend(["", "Put them out tonight 👌"])
     return "\n".join(lines)
 
 
 def main():
     s = requests.Session()
 
-    # Cookie observed in the HTML (anti-bot-ish)
-    s.cookies.set(
-        "x-bni-ja", "1707374704", domain="bincollection.northumberland.gov.uk", path="/"
-    )
+    # When running on GitHub Actions, only run at 7pm UK time (BST/GMT safe).
+    if os.getenv("GITHUB_ACTIONS") == "true" and not is_7pm_uk_now():
+        print("Not 7pm UK time — exiting (GitHub Actions run).")
+        return
 
-    # 1) Load postcode entry page to get CSRF
+    # Cookie observed in HTML (anti-bot-ish)
+    s.cookies.set("x-bni-ja", "1707374704", domain="bincollection.northumberland.gov.uk", path="/")
+
+    # 1) Load postcode page for CSRF
     r0 = s.get(f"{BASE}/", timeout=30)
     r0.raise_for_status()
     soup0 = BeautifulSoup(r0.text, "lxml")
     csrf0 = get_csrf(soup0)
 
-    # 2) Submit postcode -> address selection page
+    # 2) Submit postcode -> address select page
     r1 = s.post(
         f"{BASE}/postcode",
         data={"_csrf": csrf0, "postcode": POSTCODE},
@@ -189,7 +188,7 @@ def main():
     print(f"\nSelected address: {address_label} (value={address_value})")
     print(f"Submitting to: {submit_url}")
 
-    # 3) Submit selected address -> schedule page
+    # 3) Submit address -> schedule page
     r2 = s.post(
         submit_url,
         data={"_csrf": csrf1, "address": address_value},
@@ -199,7 +198,7 @@ def main():
     r2.raise_for_status()
     save_html("schedule_page.html", r2.text)
 
-    # 4) Extract next collections from the schedule page
+    # 4) Extract next collections
     collections = extract_next_collections(r2.text)
     if not collections:
         print("\nCouldn't find next-collection cards in the schedule page.")
@@ -213,7 +212,6 @@ def main():
         flag = " (TOMORROW)" if c["date"] == tomorrow else ""
         print(f"- {c['type']} → {c['raw']} ({c['day']}){flag}")
 
-    # 5) Reminder logic (only bins in WATCH_FOR)
     watched = [c for c in collections if c["type"] in WATCH_FOR]
     due_tomorrow = [c for c in watched if c["date"] == tomorrow]
 
